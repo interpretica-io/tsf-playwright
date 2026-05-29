@@ -15,6 +15,18 @@
 // JSON text of the result. The runner handles requests one at a time,
 // in order. It exits after 'close' or when stdin ends.
 //
+// Observing what the page does on the network (leak detection: the
+// browser hands us the plaintext, before TLS). 'launch' takes options:
+//   capture_network  keep a log of every HTTP request/response (headers
+//                    and bodies) and every WebSocket frame the page makes;
+//   har_path         write a full HAR of the session to this path on the
+//                    agent (flushed when the context closes, i.e. 'close');
+//   record_trace     record a Playwright trace (snapshots + network).
+// Then:
+//   {"cmd":"network_dump"}   -> JSON array of the captured entries
+//   {"cmd":"network_grep","needle":"<s>"} -> count of <s> across the log
+//   {"cmd":"trace_stop","path":"<p>"}     -> write the trace zip to <p>
+//
 // Usage: node te_playwright_runner.cjs [--playwright=<dir>]
 //                                      [--browsers-path=<dir>]
 //
@@ -60,10 +72,90 @@ let browser = null;
 let context = null;
 let page = null;
 
+// Captured network activity, when 'launch' asked for capture_network.
+// One entry per HTTP request and per WebSocket frame; bodies are kept
+// as text, capped, so a canary token planted in the test shows up in a
+// 'network_grep' whatever channel carried it out.
+let netlog = [];
+let netpending = [];
+const NET_BODY_CAP = 1 << 20; // 1 MiB per body/frame
+
 function needPage() {
     if (page === null)
         throw new Error('browser is not launched');
     return page;
+}
+
+function capBody(s) {
+    if (typeof s !== 'string')
+        return s;
+    return s.length > NET_BODY_CAP ? s.slice(0, NET_BODY_CAP) : s;
+}
+
+// Attach handlers that record the page's egress. The browser exposes it
+// in the clear, so TLS is not in the way here.
+function installNetworkCapture(pg) {
+    pg.on('requestfinished', (request) => {
+        const p = (async () => {
+            const entry = {
+                type: 'http',
+                method: request.method(),
+                url: request.url(),
+                resource_type: request.resourceType(),
+                request_headers: request.headers(),
+                request_body: capBody(request.postData() || ''),
+            };
+            try {
+                const resp = await request.response();
+                if (resp !== null) {
+                    entry.status = resp.status();
+                    entry.response_headers = resp.headers();
+                    try {
+                        entry.response_body = capBody(await resp.text());
+                    } catch (e) {
+                        entry.response_body = null;
+                    }
+                }
+            } catch (e) {
+                /* response gone; keep the request line */
+            }
+            netlog.push(entry);
+        })();
+        netpending.push(p);
+    });
+    pg.on('requestfailed', (request) => {
+        const f = request.failure();
+        netlog.push({
+            type: 'http',
+            method: request.method(),
+            url: request.url(),
+            resource_type: request.resourceType(),
+            request_headers: request.headers(),
+            request_body: capBody(request.postData() || ''),
+            failure: (f && f.errorText) || 'failed',
+        });
+    });
+    pg.on('websocket', (ws) => {
+        const url = ws.url();
+        ws.on('framesent', (data) => {
+            netlog.push({ type: 'ws_sent', url,
+                          payload: capBody(String(data.payload)) });
+        });
+        ws.on('framereceived', (data) => {
+            netlog.push({ type: 'ws_received', url,
+                          payload: capBody(String(data.payload)) });
+        });
+    });
+}
+
+// Some response bodies are still being read when a dump/grep arrives;
+// wait for them so the log is complete.
+async function drainNetwork() {
+    while (netpending.length > 0) {
+        const pend = netpending;
+        netpending = [];
+        await Promise.allSettled(pend);
+    }
 }
 
 // Run 'playwright test' in a project directory and reduce the JSON
@@ -147,11 +239,53 @@ const commands = {
             throw new Error(`unknown browser '${name}'`);
 
         browser = await type.launch({ headless: r.headless !== false });
-        context = await browser.newContext();
+
+        const ctxOpts = {};
+        if (r.har_path)
+            ctxOpts.recordHar = { path: r.har_path, content: 'embed' };
+        context = await browser.newContext(ctxOpts);
         if (r.timeout)
             context.setDefaultTimeout(r.timeout);
+        if (r.record_trace)
+            await context.tracing.start({ screenshots: true, snapshots: true });
+
         page = await context.newPage();
+        if (r.capture_network) {
+            netlog = [];
+            netpending = [];
+            installNetworkCapture(page);
+        }
         return `${name} ${browser.version()}`;
+    },
+
+    async network_dump(r) {
+        await drainNetwork();
+        const out = JSON.stringify(netlog);
+        if (r.clear)
+            netlog = [];
+        return out;
+    },
+
+    async network_grep(r) {
+        await drainNetwork();
+        const needle = r.needle || '';
+        if (needle === '')
+            return '0';
+        const hay = JSON.stringify(netlog);
+        let count = 0;
+        let idx = 0;
+        while ((idx = hay.indexOf(needle, idx)) !== -1) {
+            count++;
+            idx += needle.length;
+        }
+        return String(count);
+    },
+
+    async trace_stop(r) {
+        if (context === null)
+            throw new Error('no browser context to stop tracing on');
+        await context.tracing.stop({ path: r.path });
+        return r.path;
     },
 
     async goto(r) {
@@ -234,6 +368,14 @@ const commands = {
     },
 
     async close() {
+        /* Close the context first so a recorded HAR is flushed to disk. */
+        if (context !== null) {
+            try {
+                await context.close();
+            } catch (e) {
+                /* ignore: the browser close below tears it down anyway */
+            }
+        }
         if (browser !== null)
             await browser.close();
         browser = null;

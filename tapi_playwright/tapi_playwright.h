@@ -99,6 +99,26 @@ typedef struct tapi_playwright_opts {
     bool headed;
     /** Timeout of one action in milliseconds (0: 30000). */
     unsigned int timeout_ms;
+    /**
+     * Keep a log of every HTTP request/response (headers and bodies)
+     * and every WebSocket frame the page makes, readable with
+     * tapi_playwright_network_dump()/_grep(). The browser exposes this
+     * in the clear, before TLS - so a canary token planted by the test
+     * is visible whichever channel carried it out, which strace cannot
+     * see through an HTTPS connection.
+     */
+    bool capture_network;
+    /**
+     * Record a full HAR of the session. It is flushed when the session
+     * stops (tapi_playwright_stop()/_destroy()) and, when TE_LOG_DIR is
+     * set, copied to the engine and logged as a test artifact.
+     */
+    bool record_har;
+    /**
+     * Record a Playwright trace (snapshots + network), written by
+     * tapi_playwright_trace_save().
+     */
+    bool record_trace;
 } tapi_playwright_opts;
 
 /** Default options: headless Chromium, runner from the installation. */
@@ -334,6 +354,61 @@ extern te_errno tapi_playwright_expect_text(tapi_playwright *pw,
  * @return Status code.
  */
 extern te_errno tapi_playwright_screenshot(tapi_playwright *pw,
+                                           const char *name,
+                                           te_string *path);
+
+/**
+ * Get the captured network log as JSON text.
+ *
+ * Needs @a capture_network in the options. The result is a JSON array;
+ * each element is one HTTP request (@c type "http": @c method, @c url,
+ * @c resource_type, @c request_headers, @c request_body, and, when a
+ * response was seen, @c status, @c response_headers, @c response_body)
+ * or one WebSocket frame (@c type "ws_sent"/"ws_received": @c url,
+ * @c payload). Bodies are text, capped at 1 MiB.
+ *
+ * @param      pw    Session handle
+ * @param[out] json  JSON array as text (appended to the string)
+ *
+ * @return Status code.
+ */
+extern te_errno tapi_playwright_network_dump(tapi_playwright *pw,
+                                             te_string *json);
+
+/**
+ * Count how many times @p needle appears in the captured network log.
+ *
+ * The needle is matched across the whole log - request and response
+ * headers and bodies, and WebSocket frames - so a secret the test
+ * planted (a canary) is found whichever channel leaked it. A non-zero
+ * count is a leak of @p needle out of the page. Needs @a capture_network.
+ *
+ * @param      pw      Session handle
+ * @param      needle  Substring to look for (for example a canary token)
+ * @param[out] count   Number of occurrences
+ *
+ * @return Status code.
+ */
+extern te_errno tapi_playwright_network_grep(tapi_playwright *pw,
+                                             const char *needle,
+                                             unsigned int *count);
+
+/**
+ * Stop the Playwright trace, copy the trace zip to the engine and log
+ * it as a test artifact. Needs @a record_trace in the options.
+ *
+ * The file goes to TE_LOG_DIR (or TE_TMP without it) under a unique
+ * name that ends with "_<name>.trace.zip"; open it with
+ * 'npx playwright show-trace'.
+ *
+ * @param      pw    Session handle
+ * @param      name  Name for the log and the file
+ * @param[out] path  Path of the copy on the engine (appended to the
+ *                   string; may be @c NULL)
+ *
+ * @return Status code.
+ */
+extern te_errno tapi_playwright_trace_save(tapi_playwright *pw,
                                            const char *name,
                                            te_string *path);
 

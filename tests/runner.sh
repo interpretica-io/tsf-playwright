@@ -143,6 +143,14 @@ test -z "${bad}" && ok "all $(wc -l <"${WORK}/responses" | tr -d ' ') responses 
 grep -q "te_playwright_runner: ready" "${WORK}/stderr" && ok "ready line on stderr" ||
     fail "no ready line on stderr"
 
+echo "=== network/HAR/trace capture"
+if PLAYWRIGHT_DIR="${PLAYWRIGHT_DIR}" node "${SCRIPT_DIR}/capture_test.cjs" \
+        "${RUNNER}" ; then
+    ok "capture test passed"
+else
+    fail "capture test failed"
+fi
+
 echo
 if test "${failures}" -eq 0 ; then
     echo "PASS: all checks succeeded"

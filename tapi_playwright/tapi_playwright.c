@@ -52,6 +52,9 @@ const tapi_playwright_opts tapi_playwright_default_opts = {
     .browser = TAPI_PLAYWRIGHT_CHROMIUM,
     .headed = false,
     .timeout_ms = 0,
+    .capture_network = false,
+    .record_har = false,
+    .record_trace = false,
 };
 
 struct tapi_playwright {
@@ -63,6 +66,7 @@ struct tapi_playwright {
     tapi_job_channel_t *resp;       /**< Filter that yields responses */
     char *runner;                   /**< Runner path on the agent */
     bool runner_uploaded;           /**< The library put it there */
+    char *har_remote;               /**< HAR path on the agent, or NULL */
     unsigned int next_id;           /**< Id of the next request */
     bool running;                   /**< The runner is started */
 };
@@ -434,6 +438,15 @@ tapi_playwright_create(tapi_job_factory_t *factory,
         session->runner = path.ptr;
     }
 
+    if (session->opts.record_har)
+    {
+        te_string har = TE_STRING_INIT;
+
+        tapi_file_make_custom_pathname(&har, session->opts.workdir,
+                                       "_session.har");
+        session->har_remote = har.ptr;
+    }
+
     argv[argc++] = session->opts.node;
     argv[argc++] = session->runner;
     if (session->opts.playwright_dir != NULL)
@@ -532,6 +545,18 @@ tapi_playwright_start(tapi_playwright *pw)
     te_json_add_bool(&ctx, !pw->opts.headed);
     te_json_add_key(&ctx, "timeout");
     te_json_add_integer(&ctx, pw->opts.timeout_ms);
+    if (pw->opts.capture_network)
+    {
+        te_json_add_key(&ctx, "capture_network");
+        te_json_add_bool(&ctx, true);
+    }
+    if (pw->opts.record_trace)
+    {
+        te_json_add_key(&ctx, "record_trace");
+        te_json_add_bool(&ctx, true);
+    }
+    if (pw->har_remote != NULL)
+        te_json_add_key_str(&ctx, "har_path", pw->har_remote);
 
     /* A browser launch downloads nothing but may still take a while */
     rc = request_send(pw, &ctx, &req, "launch", &version,
@@ -738,6 +763,79 @@ out:
 
 /* See description in tapi_playwright.h */
 te_errno
+tapi_playwright_network_dump(tapi_playwright *pw, te_string *json)
+{
+    return simple_command(pw, "network_dump", NULL, NULL, NULL, NULL, json);
+}
+
+/* See description in tapi_playwright.h */
+te_errno
+tapi_playwright_network_grep(tapi_playwright *pw, const char *needle,
+                             unsigned int *count)
+{
+    te_errno rc;
+    te_string value = TE_STRING_INIT;
+
+    rc = simple_command(pw, "network_grep", "needle", needle, NULL, NULL,
+                        &value);
+    if (rc == 0)
+        rc = te_strtoui(value.ptr, 10, count);
+
+    te_string_free(&value);
+    return rc;
+}
+
+/* See description in tapi_playwright.h */
+te_errno
+tapi_playwright_trace_save(tapi_playwright *pw, const char *name,
+                           te_string *path)
+{
+    te_errno rc;
+    te_string remote = TE_STRING_INIT;
+    te_string local = TE_STRING_INIT;
+    te_string suffix = TE_STRING_INIT;
+    const char *dir = getenv("TE_LOG_DIR");
+
+    if (dir == NULL)
+        dir = getenv("TE_TMP");
+    if (dir == NULL)
+    {
+        ERROR("Neither TE_LOG_DIR nor TE_TMP is set, nowhere to put "
+              "the trace");
+        return TE_RC(TE_TAPI, TE_ENOENT);
+    }
+
+    te_string_append(&suffix, "_%s.trace.zip", name);
+    tapi_file_make_custom_pathname(&remote, pw->opts.workdir, suffix.ptr);
+    tapi_file_make_custom_pathname(&local, dir, suffix.ptr);
+
+    rc = simple_command(pw, "trace_stop", "path", remote.ptr, NULL, NULL,
+                        NULL);
+    if (rc != 0)
+        goto out;
+
+    rc = rcf_ta_get_file(pw->ta, 0, remote.ptr, local.ptr);
+    if (rc != 0)
+    {
+        ERROR("Failed to copy the trace %s:%s to %s: %r", pw->ta,
+              remote.ptr, local.ptr, rc);
+        goto out;
+    }
+
+    RING_ARTIFACT("Playwright trace '%s': %s", name, local.ptr);
+    if (path != NULL)
+        te_string_append(path, "%s", local.ptr);
+
+out:
+    tapi_file_ta_unlink_fmt(pw->ta, "%s", remote.ptr);
+    te_string_free(&remote);
+    te_string_free(&local);
+    te_string_free(&suffix);
+    return rc;
+}
+
+/* See description in tapi_playwright.h */
+te_errno
 tapi_playwright_run_spec(tapi_playwright *pw, const char *project_dir,
                          const char *spec, const char *grep,
                          tapi_playwright_spec_result *result)
@@ -802,6 +900,35 @@ tapi_playwright_stop(tapi_playwright *pw)
     if (rc != 0)
         WARN("Playwright did not close in an orderly way: %r", rc);
 
+    /* 'close' closes the context, which flushes the HAR to the agent. */
+    if (pw->har_remote != NULL)
+    {
+        const char *dir = getenv("TE_LOG_DIR");
+
+        if (dir == NULL)
+            dir = getenv("TE_TMP");
+        if (dir == NULL)
+        {
+            WARN("Neither TE_LOG_DIR nor TE_TMP is set, keeping the HAR "
+                 "on %s:%s", pw->ta, pw->har_remote);
+        }
+        else
+        {
+            te_string local = TE_STRING_INIT;
+            te_errno get_rc;
+
+            tapi_file_make_custom_pathname(&local, dir, "_session.har");
+            get_rc = rcf_ta_get_file(pw->ta, 0, pw->har_remote, local.ptr);
+            if (get_rc != 0)
+                WARN("Failed to copy the HAR %s:%s to %s: %r", pw->ta,
+                     pw->har_remote, local.ptr, get_rc);
+            else
+                RING_ARTIFACT("Playwright HAR: %s", local.ptr);
+            tapi_file_ta_unlink_fmt(pw->ta, "%s", pw->har_remote);
+            te_string_free(&local);
+        }
+    }
+
     rc = tapi_job_wait(pw->job, RUNNER_EXIT_TIMEOUT_MS, &status);
     if (rc != 0)
     {
@@ -834,5 +961,6 @@ tapi_playwright_destroy(tapi_playwright *pw)
     free((char *)pw->opts.browsers_path);
     free((char *)pw->opts.workdir);
     free(pw->runner);
+    free(pw->har_remote);
     free(pw);
 }

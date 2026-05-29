@@ -14,7 +14,8 @@ The library:
   logs what it did, so a failure points at the step. A screenshot goes
   to the engine and into the log as a test artifact.
   `tapi_playwright_run_spec()` runs a ready `playwright test` project
-  on the agent and reports the counts.
+  on the agent and reports the counts. It can also **observe the
+  browser's own traffic** — see *Watching the traffic* below.
 
 The TAPI talks to `te_playwright_runner.cjs`, a Node.js script that
 ships with the library. The TAPI uploads the script to the agent with
@@ -91,6 +92,53 @@ cleanup:
 Selectors are Playwright selectors: CSS, `text=...`, `xpath=...`,
 `role=...`.
 
+## Watching the traffic
+
+The browser sees every request the page makes **in the clear, before
+TLS** — so it is the right place to catch what a web page sends out,
+where an `strace` on the browser process would see only ciphertext.
+Turn it on in the options:
+
+```c
+opts = tapi_playwright_default_opts;
+opts.capture_network = true;   /* log requests/responses and WS frames */
+opts.record_har = true;        /* full HAR, saved as an artifact on stop */
+opts.record_trace = true;      /* Playwright trace (snapshots + network) */
+CHECK_RC(tapi_playwright_create(factory, &opts, &pw));
+CHECK_RC(tapi_playwright_start(pw));
+```
+
+Then drive the page as usual and read the traffic back:
+
+```c
+unsigned int hits;
+
+CHECK_RC(tapi_playwright_goto(pw, url));
+CHECK_RC(tapi_playwright_wait_load(pw, TAPI_PLAYWRIGHT_NETWORKIDLE));
+
+/* Leak detection with a canary: plant a known secret in the input and
+ * assert it never leaves the page. A non-zero count is a leak, whichever
+ * channel (request body, header, WebSocket frame) carried it out. */
+CHECK_RC(tapi_playwright_network_grep(pw, canary, &hits));
+if (hits != 0)
+    TEST_VERDICT("the page sent the canary out %u time(s)", hits);
+```
+
+- `tapi_playwright_network_dump()` returns the whole log as JSON — one
+  entry per HTTP request (method, URL, headers, request and response
+  bodies) and per WebSocket frame.
+- `tapi_playwright_network_grep()` counts a substring across the whole
+  log — the canary check above.
+- `tapi_playwright_trace_save()` writes the trace zip to the engine as
+  an artifact (open it with `npx playwright show-trace`).
+- the HAR is flushed and copied to the engine when the session stops.
+
+This captures what the *page* does through the browser. What the browser
+*binary* itself does at the OS level (telemetry, update pings, a native
+messaging host, an extension's own connection) is out of its view — for
+that, run the browser under `strace`/eBPF (`tsf-cybersec`'s `tapi_egress`)
+alongside. The two are complementary.
+
 ## Protocol
 
 The runner reads one JSON object per line from stdin and writes one
@@ -106,14 +154,18 @@ per line to stdout:
 `value` is a string in every response; for `eval` it holds the JSON
 text of the result. The commands are `launch`, `goto`, `click`,
 `fill`, `press`, `select`, `wait_for`, `wait_load`, `text`, `attr`,
-`count`, `eval`, `screenshot`, `url`, `title`, `content`, `run_spec`
-and `close`; the script lists their arguments.
+`count`, `eval`, `screenshot`, `url`, `title`, `content`, `run_spec`,
+`network_dump`, `network_grep`, `trace_stop` and `close`; the script
+lists their arguments.
 
 ## Tests
 
 `tests/runner.sh` drives the runner with node against a static page
-and checks the responses. It needs a directory with
-`node_modules/playwright` and Chromium:
+and checks the responses, then runs `tests/capture_test.cjs`, which
+points a bait page at a local server, leaks a canary through `fetch()`
+and asserts `network_grep`/`network_dump`, the trace zip and the HAR all
+catch it. It needs a directory with `node_modules/playwright` and
+Chromium:
 
 ```sh
 PLAYWRIGHT_DIR=/opt/playwright ./tests/runner.sh
